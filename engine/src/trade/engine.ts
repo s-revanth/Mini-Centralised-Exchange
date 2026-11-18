@@ -1,8 +1,8 @@
-import fs from "fs";
 import dotenv from "dotenv";
 import { Order, OrderBook } from "./orderBooks";
 import { RedisManager } from "../redis/redis";
 import { randomUUID } from "crypto";
+import { EngineEvent, EngineStore } from "../persistence/store";
 dotenv.config();
 interface UserBalance {
   [key: string]: {
@@ -14,37 +14,103 @@ const BASE_CURRENCY = "USDC"
 export class Engine {
   private orderBooks: any = [];
   private balances: Map<string, UserBalance> = new Map();
+  private store: EngineStore;
+  private seq = 0; // seq of the last event applied to in-memory state
+  private snapshotSeq = 0; // seq covered by the last snapshot on disk
+
   constructor() {
-    let snapShot = null; //should come from db/s3
-    try {
-      if (process.env.SNAPSHOT) {
-        snapShot = fs.readFileSync('./snapshots.json');
-      }
-    }
-    catch (e) {
-      console.log("ERROR IN LOADING SNAPSHOT")
-    }
+    this.store = new EngineStore(process.env.ENGINE_DATA_DIR || "./data");
+    this.recover();
+    const interval = Number(process.env.SNAPSHOT_INTERVAL_MS) || 1000 * 3;
+    setInterval(() => {
+      this.saveSnapshot();
+    }, interval);
+  }
+
+  // latest snapshot (or genesis balances) + replay of every logged event after it
+  recover() {
+    const started = Date.now();
+    const snapShot = this.store.loadSnapshot();
     if (snapShot) {
-      const snapShotJson = JSON.parse(snapShot.toString());
-      this.orderBooks = snapShotJson.orderbooks.map((o: any) => new OrderBook(o.baseAsset, o.bids, o.asks, o.lastTradeId, o.currentPrice));
-      this.balances = new Map(snapShotJson.balances);
+      this.orderBooks = snapShot.orderbooks.map((o: any) => new OrderBook(o.baseAsset, o.bids, o.asks, o.lastTradeId, o.currentPrice));
+      this.balances = new Map(snapShot.balances);
+      this.seq = this.snapshotSeq = snapShot.lastSeq;
     }
     else {
       this.orderBooks = [new OrderBook(`SOL`, [], [], 0, 0)];
       this.setBaseBalances();
     }
-    setInterval(() => {
-      this.saveSnapshot();
-    }, 1000 * 3);
+    const events = this.store.readEvents();
+    let replayed = 0;
+    let mismatches = 0;
+    for (const event of events) {
+      if (event.seq <= this.seq) {
+        continue;
+      }
+      if (event.seq !== this.seq + 1) {
+        throw new Error(`event log gap: expected seq ${this.seq + 1}, found ${event.seq}`);
+      }
+      if (!this.replay(event)) {
+        mismatches++;
+      }
+      this.seq = event.seq;
+      replayed++;
+    }
+    console.log(`[recovery] done: snapshot ${snapShot ? "seq=" + snapShot.lastSeq : "none"}, ` +
+      `log has ${events.length} events, replayed ${replayed} (mismatches=${mismatches}) in ${Date.now() - started} ms, now at seq=${this.seq}`);
+  }
+
+  // re-applies a logged event; returns false if the outcome differs from the log
+  replay(event: EngineEvent): boolean {
+    const data = event.data;
+    let ok = true;
+    let fills: any[] = [];
+    try {
+      switch (event.type) {
+        case "CREATE_ORDER":
+          fills = this.createOrder(data.userId, data.price, data.quantity, data.market, data.side, data.orderId).fills;
+          break;
+        case "CANCEL_ORDER":
+          this.cancelOrder(data.orderId, data.market, data.userId);
+          break;
+        case "ADD_BALANCE":
+          this.addBalance(data.userId, data.amount);
+          break;
+      }
+    } catch (e) {
+      ok = false;
+    }
+    const same = ok === event.ok && JSON.stringify(fills) === JSON.stringify(event.fills || []);
+    if (!same) {
+      console.log(`[recovery] replay of seq=${event.seq} did not reproduce the logged outcome`);
+    }
+    return same;
+  }
+
+  // durably record a state change before any of its effects leave the engine
+  persist(type: EngineEvent["type"], data: any, ok: boolean, fills?: any[]) {
+    const event: EngineEvent = { seq: this.seq + 1, ts: Date.now(), type, data, ok };
+    if (fills) {
+      event.fills = fills;
+    }
+    this.store.append(event);
+    this.seq = event.seq;
   }
 
   saveSnapshot() {
+    if (this.seq === this.snapshotSeq) {
+      return; // nothing changed since the last snapshot
+    }
     const snapshotSnapshot = {
+      lastSeq: this.seq,
+      takenAt: Date.now(),
       orderbooks: this.orderBooks.map((o: any) => o.getSnap()),
       balances: Array.from(this.balances.entries())
     }
     //should save to s3
-    fs.writeFileSync("./snapshots.json", JSON.stringify(snapshotSnapshot));
+    this.store.writeSnapshot(snapshotSnapshot);
+    this.snapshotSeq = snapshotSnapshot.lastSeq;
+    console.log(`[snapshot] wrote seq=${snapshotSnapshot.lastSeq}`);
   }
   setBaseBalances() {
     this.balances.set("1", {
@@ -72,9 +138,24 @@ export class Engine {
 
   process({ message, clientId }: any) {
     switch (message.type) {
-      case 'CREATE_ORDER':
+      case 'CREATE_ORDER': {
+        // the id is part of the logged event so replay recreates the same order
+        const data = { ...message.data, orderId: randomUUID() };
+        let result;
         try {
-          const { executed, fills, orderId } = this.createOrder(message.data.userId, message.data.price, message.data.quantity, message.data.market, message.data.side);
+          result = this.createOrder(data.userId, data.price, data.quantity, data.market, data.side, data.orderId);
+        } catch (error) {
+          console.log("Error in creating order in the engine", error);
+        }
+        this.persist("CREATE_ORDER", data, !!result, result ? result.fills : []);
+        try {
+          if (!result) {
+            throw new Error("order rejected");
+          }
+          const { executed, fills, orderId } = result;
+          this.publisWsDepthUpdates(fills, data.price, data.side, data.market);
+          this.publishWsTrades(fills, data.userId, data.market);
+          this.createDbTrades(fills, data.market, data.userId);
           RedisManager.getInstance().sendToApi(clientId, {
             type: "ORDER_PLACED",
             payload: {
@@ -84,7 +165,6 @@ export class Engine {
             }
           });
         } catch (error) {
-          console.log("Error in creating order in the engine", error);
           RedisManager.getInstance().sendToApi(clientId, {
             type: "ORDER_CANCELLED",
             payload: {
@@ -95,45 +175,26 @@ export class Engine {
           })
         }
         break;
-      case 'CANCEL_ORDER':
+      }
+      case 'CANCEL_ORDER': {
+        const orderId = message.data.orderId;
+        const cancelMarket = message.data.market;
+        let price;
+        let ok = true;
         try {
-          const orderId = message.data.orderId;
-          const cancelMarket = message.data.market;
-          const cancelOrderbook = this.orderBooks.find((o: any) => o.ticker() === cancelMarket);
-          if (!cancelOrderbook) {
-            throw new Error("No orderbook found");
+          price = this.cancelOrder(orderId, cancelMarket, message.data.userId);
+        } catch (error) {
+          ok = false;
+          console.log("Error in cancelling order", error);
+        }
+        this.persist("CANCEL_ORDER", message.data, ok);
+        if (!ok) {
+          break;
+        }
+        try {
+          if (price) {
+            this.sendUpdatedDepthAt(price.toString(), cancelMarket);
           }
-          const quoteAsset = cancelMarket.split("_")[1];
-          const order = cancelOrderbook.asks.find((o: Order) => o.orderId === orderId) || cancelOrderbook.bids.find((o: Order) => o.orderId === orderId);
-          if (order.userId != message.data.userId) {
-            throw new Error("Unauthorized: cannot cancel others' orders");
-          }
-          if (!order) {
-            console.log("No order found");
-            throw new Error("No order found");
-          }
-          if (order.side === "buy") {
-            const price = cancelOrderbook.cancelBuys(order)
-            const leftQuantityPrice = (order.quantity - order.filled) * order.price;
-            //@ts-ignore
-            this.balances.get(order.userId)[BASE_CURRENCY].available += leftQuantityPrice;
-            //@ts-ignore
-            this.balances.get(order.userId)[BASE_CURRENCY].locked -= leftQuantityPrice;
-            if (price) {
-              this.sendUpdatedDepthAt(price.toString(), cancelMarket);
-            }
-          } else {
-            const price = cancelOrderbook.cancelSells(order)
-            const leftQuantity = order.quantity - order.filled;
-            //@ts-ignore
-            this.balances.get(order.userId)[quoteAsset].available += leftQuantity;
-            //@ts-ignore
-            this.balances.get(order.userId)[quoteAsset].locked -= leftQuantity;
-            if (price) {
-              this.sendUpdatedDepthAt(price.toString(), cancelMarket);
-            }
-          }
-
           RedisManager.getInstance().sendToApi(clientId, {
             type: "ORDER_CANCELLED",
             payload: {
@@ -148,6 +209,7 @@ export class Engine {
           console.log("Error in cancelling order", error);
         }
         break;
+      }
       case 'GET_OPEN_ORDERS':
         try {
           const openOrderbook = this.orderBooks.find((o: any) => o.ticker() === message.data.market);
@@ -185,29 +247,71 @@ export class Engine {
           payload: this.balances.get(message.data.userId) || {}
         });
         break;
-      case 'ADD_BALANCE':
+      case 'ADD_BALANCE': {
+        let ok = true;
         try {
-          const userId = message.data.userId;
-          const amount = Number(message.data.amount);
-          const userBalance = this.balances.get(userId);
-          if (!userBalance) {
-            this.balances.set(userId, {
-              [BASE_CURRENCY]: {
-                available: amount,
-                locked: 0
-              }
-            });
-          } else {
-            userBalance[BASE_CURRENCY]!.available += amount;
-          }
+          this.addBalance(message.data.userId, message.data.amount);
         } catch (error) {
+          ok = false;
           console.log("Error in adding funds", error);
         }
+        this.persist("ADD_BALANCE", message.data, ok);
+      }
+    }
+  }
+
+  addBalance(userId: string, rawAmount: string) {
+    const amount = Number(rawAmount);
+    const userBalance = this.balances.get(userId);
+    if (!userBalance) {
+      this.balances.set(userId, {
+        [BASE_CURRENCY]: {
+          available: amount,
+          locked: 0
+        }
+      });
+    } else {
+      userBalance[BASE_CURRENCY]!.available += amount;
+    }
+  }
+
+  // mutates the book and balances only; the caller publishes depth updates
+  cancelOrder(orderId: string, cancelMarket: string, userId: string) {
+    const cancelOrderbook = this.orderBooks.find((o: any) => o.ticker() === cancelMarket);
+    if (!cancelOrderbook) {
+      throw new Error("No orderbook found");
+    }
+    const quoteAsset = cancelMarket.split("_")[1];
+    const order = cancelOrderbook.asks.find((o: Order) => o.orderId === orderId) || cancelOrderbook.bids.find((o: Order) => o.orderId === orderId);
+    if (order.userId != userId) {
+      throw new Error("Unauthorized: cannot cancel others' orders");
+    }
+    if (!order) {
+      console.log("No order found");
+      throw new Error("No order found");
+    }
+    if (order.side === "buy") {
+      const price = cancelOrderbook.cancelBuys(order)
+      const leftQuantityPrice = (order.quantity - order.filled) * order.price;
+      //@ts-ignore
+      this.balances.get(order.userId)[BASE_CURRENCY].available += leftQuantityPrice;
+      //@ts-ignore
+      this.balances.get(order.userId)[BASE_CURRENCY].locked -= leftQuantityPrice;
+      return price;
+    } else {
+      const price = cancelOrderbook.cancelSells(order)
+      const leftQuantity = order.quantity - order.filled;
+      //@ts-ignore
+      this.balances.get(order.userId)[quoteAsset].available += leftQuantity;
+      //@ts-ignore
+      this.balances.get(order.userId)[quoteAsset].locked -= leftQuantity;
+      return price;
     }
   }
 
 
-  createOrder(userId: string, price: string, quantity: string, market: string, side: "BUY" | "SELL") {
+  // mutates the book and balances only; the caller publishes trades/depth after logging
+  createOrder(userId: string, price: string, quantity: string, market: string, side: "BUY" | "SELL", orderId: string) {
     const orderBook = this.orderBooks.find((o: any) => { return o.ticker() == market });
     const baseAsset = market.split("_")[0]!;
     const quoteAsset = market.split("_")[1]!;
@@ -218,18 +322,13 @@ export class Engine {
     const order = {
       price: Number(price),
       quantity: Number(quantity),
-      orderId: randomUUID(),
+      orderId: orderId,
       filled: 0,
       side: side,
       userId: userId
     }
     const { fills, executed } = orderBook.createOrder(order);
     this.updateFunds(userId, baseAsset, quoteAsset, side, fills, executed);
-    console.log(this.orderBooks[0].asks);
-    console.log(this.orderBooks[0].bids);
-    this.publisWsDepthUpdates(fills, price, side, market);
-    this.publishWsTrades(fills, userId, market);
-    this.createDbTrades(fills, market, userId);
     return { executed, fills, orderId: order.orderId };
   }
 

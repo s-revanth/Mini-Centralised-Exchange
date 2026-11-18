@@ -44,6 +44,10 @@ services:
       - redis
     environment:
       REDIS_URL: redis://redis:6379
+      ENGINE_DATA_DIR: /app/data
+      SNAPSHOT_INTERVAL_MS: 3000
+    volumes:
+      - engine-data:/app/data
     networks:
       - backend
 
@@ -73,6 +77,7 @@ services:
 
 volumes:
   postgres-data:
+  engine-data:
 
 networks:
   backend:
