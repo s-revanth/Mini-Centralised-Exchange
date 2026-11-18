@@ -58,6 +58,20 @@ app.get("/api/v1/depth", async (req: Request, res: Response) => {
     res.status(500).json({ message: "Error in getting depth", error });
   }
 })
+app.get("/api/v1/balance", async (req: Request, res: Response) => {
+  try {
+    const response: any = await RedisManager.getInstance().sendAndWait({
+      type: "GET_BALANCE",
+      data: {
+        userId: req.query.userId as string
+      }
+    })
+    res.status(200).json(response.payload);
+  } catch (error) {
+    console.log("Error in getting balance");
+    res.status(500).json({ message: "Error in getting balance", error });
+  }
+})
 app.listen(PORT, () => {
   console.log(`Server running on PORT ${PORT}`)
 });

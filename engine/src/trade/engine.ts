@@ -179,6 +179,12 @@ export class Engine {
           console.log("Error in getting market depth", error);
         }
         break;
+      case 'GET_BALANCE':
+        RedisManager.getInstance().sendToApi(clientId, {
+          type: "BALANCE",
+          payload: this.balances.get(message.data.userId) || {}
+        });
+        break;
       case 'ADD_BALANCE':
         try {
           const userId = message.data.userId;
